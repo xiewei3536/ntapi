@@ -17,8 +17,8 @@ from app.core.config import settings
 from app.providers.base_provider import BaseProvider
 from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
 
-MAX_RETRY_ATTEMPTS = 3
-RETRY_DELAY_SECONDS = 1
+MAX_RETRY_ATTEMPTS = 10
+RETRY_DELAY_SECONDS = 2
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
