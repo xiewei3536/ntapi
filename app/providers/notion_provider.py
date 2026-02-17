@@ -134,18 +134,25 @@ class NotionAIProvider(BaseProvider):
                         elif text_type == 'incremental':
                             incremental_fragments.append(content)
               
+                # 【修复】优先使用 record-map 的 final 消息（已组装好的干净回复）
+                # 增量片段包含模型的思考过程，不应优先使用
                 full_response = ""
                 if final_message:
-                    full_response = final_message
-                    logger.info(f"使用 final 消息 (长度={len(final_message)})")
+                    cleaned_final = self._clean_content(final_message)
+                    if cleaned_final:
+                        full_response = final_message
+                        logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
+                    else:
+                        logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
                 
-                if incremental_fragments:
+                if not full_response and incremental_fragments:
                     joined = "".join(incremental_fragments)
-                    logger.info(f"增量拼接消息 (长度={len(joined)})")
-                    # 如果增量拼接的内容更长，优先使用
-                    if len(joined) > len(full_response):
+                    cleaned_joined = self._clean_content(joined)
+                    if cleaned_joined:
                         full_response = joined
-                        logger.info("增量拼接内容更长，使用增量拼接。")
+                        logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
+                    else:
+                        logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
 
                 if full_response:
                     cleaned_response = self._clean_content(full_response)
@@ -296,12 +303,14 @@ class NotionAIProvider(BaseProvider):
             after_lang = content[lang_match.end():].strip()
             if after_lang:
                 content = after_lang
-            # 如果 <lang> 之后没有内容，保留原始 content 继续清洗
         
         # 清除残留的 <lang 标签片段
         content = re.sub(r'<lang\b[^>]*(?:>|$)', '', content)
         # 清除残留的 primary="..." 片段
         content = re.sub(r'^\s*primary="[^"]*"\s*[-–]?\s*', '', content)
+        
+        # 清除 <websearch>...</websearch> 工具调用标签（AI 内部指令，非用户内容）
+        content = re.sub(r'<websearch>[\s\S]*?</websearch>\s*', '', content, flags=re.IGNORECASE)
         
         # 清除 thinking 标签
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
@@ -377,29 +386,42 @@ class NotionAIProvider(BaseProvider):
                 if "thread_message" in record_map:
                     last_content = ""
                     last_step_type = ""
+                    msg_count = 0
                     for msg_id, msg_data in record_map["thread_message"].items():
+                        msg_count += 1
                         value_data = msg_data.get("value", {}).get("value", {})
                         step = value_data.get("step", {})
-                        if not step: continue
+                        
+                        # 【调试】打印每条 thread_message 的结构
+                        if not step:
+                            logger.info(f"[record-map] msg_id={msg_id}, no step, value keys={list(value_data.keys())[:5]}")
+                            continue
 
                         content = ""
                         step_type = step.get("type")
+                        logger.info(f"[record-map] msg_id={msg_id}, step_type={step_type}")
 
                         if step_type == "markdown-chat":
                             content = step.get("value", "")
                         elif step_type == "agent-inference":
+                            # 【修复】合并所有 text 类型的内容（不再 break 取第一条）
                             agent_values = step.get("value", [])
+                            text_parts = []
                             if isinstance(agent_values, list):
                                 for item in agent_values:
                                     if isinstance(item, dict) and item.get("type") == "text":
-                                        content = item.get("content", "")
-                                        break
+                                        text_content = item.get("content", "")
+                                        if text_content:
+                                            text_parts.append(text_content)
+                                            logger.info(f"[record-map] text item (长度={len(text_content)}): {text_content[:100]}...")
+                            content = "\n".join(text_parts) if text_parts else ""
                         
                         if content and isinstance(content, str):
-                            logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:80]}...")
+                            logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:120]}...")
                             last_content = content
                             last_step_type = step_type
                     
+                    logger.info(f"[record-map] 共扫描 {msg_count} 条 thread_message")
                     # 使用最后一条消息（而非第一条问候语）
                     if last_content:
                         logger.info(f"从 record-map 选择最后一条消息 (type: {last_step_type})。")
