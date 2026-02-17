@@ -4,6 +4,7 @@ import time
 import logging
 import uuid
 import re
+import asyncio
 import cloudscraper
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
@@ -15,6 +16,9 @@ from fastapi.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.providers.base_provider import BaseProvider
 from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+MAX_RETRY_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -114,73 +118,91 @@ class NotionAIProvider(BaseProvider):
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
-            incremental_fragments: List[str] = []
-            final_message: Optional[str] = None
             
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
                 mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
-                
                 thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
-                
-                thread_id = await self._create_thread(thread_type)
-                payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
-                headers = self._prepare_headers()
 
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
-                def sync_stream_iterator():
-                    try:
-                        logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
-                        logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-                        
-                        response = self.scraper.post(
-                            self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
-                            timeout=settings.API_REQUEST_TIMEOUT
-                        )
-                        response.raise_for_status()
-                        for line in response.iter_lines():
-                            if line:
-                                yield line
-                    except Exception as e:
-                        yield e
-
-                sync_gen = sync_stream_iterator()
-              
-                while True:
-                    line = await run_in_threadpool(lambda: next(sync_gen, None))
-                    if line is None:
-                        break
-                    if isinstance(line, Exception):
-                        raise line
-
-                    parsed_results = self._parse_ndjson_line_to_texts(line)
-                    for text_type, content in parsed_results:
-                        if text_type == 'final':
-                            final_message = content
-                        elif text_type == 'incremental':
-                            incremental_fragments.append(content)
-              
-                # 【修复】优先使用 record-map 的 final 消息（已组装好的干净回复）
-                # 增量片段包含模型的思考过程，不应优先使用
+                # 【重试机制】最多重试 MAX_RETRY_ATTEMPTS 次
                 full_response = ""
-                if final_message:
-                    cleaned_final = self._clean_content(final_message)
-                    if cleaned_final:
-                        full_response = final_message
-                        logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
-                    else:
-                        logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
+                last_error_msg = ""
                 
-                if not full_response and incremental_fragments:
-                    joined = "".join(incremental_fragments)
-                    cleaned_joined = self._clean_content(joined)
-                    if cleaned_joined:
-                        full_response = joined
-                        logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
+                for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                    incremental_fragments: List[str] = []
+                    final_message: Optional[str] = None
+                    error_message_from_notion: Optional[str] = None
+                    
+                    thread_id = await self._create_thread(thread_type)
+                    payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
+                    headers = self._prepare_headers()
+
+                    def sync_stream_iterator():
+                        try:
+                            logger.info(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] 请求 Notion AI URL: {self.api_endpoints['runInference']}")
+                            logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                            
+                            response = self.scraper.post(
+                                self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
+                                timeout=settings.API_REQUEST_TIMEOUT
+                            )
+                            response.raise_for_status()
+                            for line in response.iter_lines():
+                                if line:
+                                    yield line
+                        except Exception as e:
+                            yield e
+
+                    sync_gen = sync_stream_iterator()
+                  
+                    while True:
+                        line = await run_in_threadpool(lambda: next(sync_gen, None))
+                        if line is None:
+                            break
+                        if isinstance(line, Exception):
+                            raise line
+
+                        parsed_results = self._parse_ndjson_line_to_texts(line)
+                        for text_type, content in parsed_results:
+                            if text_type == 'final':
+                                final_message = content
+                            elif text_type == 'incremental':
+                                incremental_fragments.append(content)
+                            elif text_type == 'error':
+                                error_message_from_notion = content
+                  
+                    # 优先使用 record-map 的 final 消息
+                    if final_message:
+                        cleaned_final = self._clean_content(final_message)
+                        if cleaned_final:
+                            full_response = final_message
+                            logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
+                        else:
+                            logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
+                    
+                    if not full_response and incremental_fragments:
+                        joined = "".join(incremental_fragments)
+                        cleaned_joined = self._clean_content(joined)
+                        if cleaned_joined:
+                            full_response = joined
+                            logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
+                        else:
+                            logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
+
+                    if full_response:
+                        # 成功获取到回复，跳出重试循环
+                        break
+                    
+                    # 没有有效回复
+                    last_error_msg = error_message_from_notion or "Notion 返回空回复"
+                    if attempt < MAX_RETRY_ATTEMPTS:
+                        logger.warning(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] Notion 返回 error: {last_error_msg}，{RETRY_DELAY_SECONDS}秒后重试...")
+                        await asyncio.sleep(RETRY_DELAY_SECONDS)
                     else:
-                        logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
+                        logger.error(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] 所有重试均失败。最后错误: {last_error_msg}")
 
                 if full_response:
                     cleaned_response = self._clean_content(full_response)
@@ -189,7 +211,11 @@ class NotionAIProvider(BaseProvider):
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
                 else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                    # 所有重试都失败，返回错误信息给用户
+                    error_reply = f"⚠️ Notion AI 返回错误，已重试 {MAX_RETRY_ATTEMPTS} 次仍失败。\n错误信息: {last_error_msg}\n请稍后再试。"
+                    logger.warning(f"所有重试均失败，返回错误信息给用户: {error_reply}")
+                    chunk = create_chat_completion_chunk(request_id, model_name, content=error_reply)
+                    yield create_sse_data(chunk)
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -480,8 +506,19 @@ class NotionAIProvider(BaseProvider):
                                             text_parts.append(text_content)
                                             logger.info(f"[record-map] text item (长度={len(text_content)}): {text_content[:100]}...")
                             content = "\n".join(text_parts) if text_parts else ""
+                        elif step_type == "error":
+                            # 【提取错误信息】
+                            error_value = step.get("value", {})
+                            if isinstance(error_value, dict):
+                                error_msg = error_value.get("message", "") or error_value.get("error", "") or str(error_value)
+                            elif isinstance(error_value, str):
+                                error_msg = error_value
+                            else:
+                                error_msg = str(error_value)
+                            logger.warning(f"[record-map] Notion 错误: {error_msg}")
+                            content = error_msg
                         
-                        if content and isinstance(content, str):
+                        if content and isinstance(content, str) and step_type != "error":
                             logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:120]}...")
                         
                         all_messages.append({"step_type": step_type, "content": content})
@@ -497,19 +534,25 @@ class NotionAIProvider(BaseProvider):
                     # 只在最后一条 user 消息之后搜索 agent-inference
                     new_content = ""
                     new_step_type = ""
+                    error_content = ""
                     search_start = last_user_idx + 1 if last_user_idx >= 0 else 0
                     for i in range(search_start, len(all_messages)):
                         msg = all_messages[i]
                         if msg["step_type"] in ("agent-inference", "markdown-chat") and msg["content"]:
                             new_content = msg["content"]
                             new_step_type = msg["step_type"]
+                        elif msg["step_type"] == "error" and msg["content"]:
+                            error_content = msg["content"]
                     
                     if new_content:
                         logger.info(f"从 record-map 选择最后一条 user 之后的新消息 (type: {new_step_type})。")
                         results.append(('final', new_content))
+                    elif error_content:
+                        logger.warning(f"[record-map] Notion 返回错误: {error_content}")
+                        results.append(('error', error_content))
                     elif last_user_idx >= 0:
-                        # 最后一条 user 之后没有 agent-inference，可能是 error
                         logger.warning(f"[record-map] 最后一条 user 之后没有找到有效的 agent-inference（可能 Notion 返回了 error）")
+                        results.append(('error', '未知错误'))
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
