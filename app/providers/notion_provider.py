@@ -100,7 +100,10 @@ class NotionAIProvider(BaseProvider):
             return False
         
         try:
-            logger.info(f"正在登入 Notion... (email: {email[:5]}***)")
+            # Debug: 打印凭证信息（安全脱敏）
+            logger.info(f"正在登入 Notion...")
+            logger.info(f"  Email: {email}")
+            logger.info(f"  Password 长度: {len(password)}, 首字: '{password[0]}', 尾字: '{password[-1]}'")
             
             # 使用 requests.Session (参考 notion-py 的做法)
             session = req.Session()
@@ -552,7 +555,7 @@ class NotionAIProvider(BaseProvider):
             "createThread": False,
             "isPartialTranscript": True,
             "asPatchResponse": True,
-            "generateTitle": True,
+            "generateTitle": False,
             "saveAllThreadOperations": True,
             "threadType": thread_type
         }
