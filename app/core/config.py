@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     NOTION_USER_ID: Optional[str] = None
     NOTION_USER_NAME: Optional[str] = None
     NOTION_USER_EMAIL: Optional[str] = None
+    NOTION_PASSWORD: Optional[str] = None  # Notion 帐号密码，用于自动刷新 token
     NOTION_BLOCK_ID: Optional[str] = None
     NOTION_CLIENT_VERSION: Optional[str] = "23.13.20260217.0001"
 

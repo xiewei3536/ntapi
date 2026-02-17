@@ -25,7 +25,12 @@ async def session_keepalive_task():
         try:
             success = await provider.keepalive()
             if not success:
-                logger.warning("Session 保活失败，Token 可能已过期！请通过 /admin/update-token 更新。")
+                logger.warning("Session 保活失败，尝试自动刷新 Token...")
+                refresh_ok = await provider.auto_refresh_token()
+                if refresh_ok:
+                    logger.info("✅ 保活失败后自动刷新 Token 成功！")
+                else:
+                    logger.error("❌ 保活失败，自动刷新 Token 也失败！请手动更新 Token。")
         except Exception as e:
             logger.error(f"Session 保活任务异常: {e}")
 
