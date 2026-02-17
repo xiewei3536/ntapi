@@ -42,6 +42,34 @@ class NotionAIProvider(BaseProvider):
             logger.info("会话预热成功。")
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
+
+    def update_token(self, new_token: str):
+        """热更新 Notion Cookie/Token，无需重启服务"""
+        old_token_preview = (settings.NOTION_COOKIE or "")[:20] + "..."
+        settings.NOTION_COOKIE = new_token
+        # 重新创建 scraper 以清除旧 session
+        self.scraper = cloudscraper.create_scraper()
+        self._warmup_session()
+        new_token_preview = new_token[:20] + "..."
+        logger.info(f"Token 已热更新: {old_token_preview} -> {new_token_preview}")
+
+    async def keepalive(self):
+        """发送保活请求，维持 Notion session"""
+        try:
+            headers = self._prepare_headers()
+            headers.pop("Accept", None)
+            response = await run_in_threadpool(
+                lambda: self.scraper.get("https://www.notion.so/api/v3/getSpaces", headers=headers, timeout=30)
+            )
+            if response.status_code == 200:
+                logger.info("Session 保活成功 ✓")
+                return True
+            else:
+                logger.warning(f"Session 保活返回非 200 状态码: {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Session 保活失败: {e}")
+            return False
             
     async def _create_thread(self, thread_type: str) -> str:
         thread_id = str(uuid.uuid4())

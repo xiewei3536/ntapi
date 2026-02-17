@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     API_REQUEST_TIMEOUT: int = 180
     NGINX_PORT: int = 8088
+    SESSION_KEEPALIVE_INTERVAL: int = 300  # 会话保活间隔（秒），默认 5 分钟
 
     # 更新所有已知的模型列表（匹配 Notion AI 当前支持的模型）
     DEFAULT_MODEL: str = "claude-sonnet-4.5"
