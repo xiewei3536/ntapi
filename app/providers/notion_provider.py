@@ -87,8 +87,7 @@ class NotionAIProvider(BaseProvider):
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
             incremental_fragments: List[str] = []
-            patch_final_message: Optional[str] = None
-            record_map_message: Optional[str] = None
+            final_message: Optional[str] = None
             
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
@@ -131,44 +130,27 @@ class NotionAIProvider(BaseProvider):
                     parsed_results = self._parse_ndjson_line_to_texts(line)
                     for text_type, content in parsed_results:
                         if text_type == 'final':
-                            # patch 流中的完整消息（来自 patch 或 markdown-chat 事件）
-                            patch_final_message = content
+                            final_message = content
                         elif text_type == 'incremental':
                             incremental_fragments.append(content)
-                        elif text_type == 'record-map-final':
-                            # record-map 中的消息（可能包含初始问候语，仅作 fallback）
-                            record_map_message = content
               
-                # 【修复】智能响应选择：结合内容长度和来源优先级
                 full_response = ""
+                if final_message:
+                    full_response = final_message
+                    logger.info(f"使用 final 消息 (长度={len(final_message)})")
                 
-                # 先尝试 patch 流完整消息
-                candidate_patch = patch_final_message or ""
-                # 再尝试增量拼接
-                candidate_incremental = "".join(incremental_fragments) if incremental_fragments else ""
-                # record-map 作为 fallback
-                candidate_record_map = record_map_message or ""
-                
-                # 预清洗所有候选内容，选择清洗后最长的有效内容
-                cleaned_patch = self._clean_content(candidate_patch)
-                cleaned_incremental = self._clean_content(candidate_incremental)
-                cleaned_record_map = self._clean_content(candidate_record_map)
-                
-                if cleaned_patch and len(cleaned_patch) >= len(cleaned_incremental) and len(cleaned_patch) >= len(cleaned_record_map):
-                    full_response = candidate_patch
-                    logger.info(f"使用 patch 流中的完整消息作为最终响应 (长度={len(cleaned_patch)})。")
-                elif cleaned_incremental and len(cleaned_incremental) >= len(cleaned_record_map):
-                    full_response = candidate_incremental
-                    logger.info(f"使用增量拼接消息作为最终响应 (长度={len(cleaned_incremental)})。")
-                elif cleaned_record_map:
-                    full_response = candidate_record_map
-                    logger.info(f"使用 record-map 中的消息作为最终响应 (长度={len(cleaned_record_map)})。")
-                else:
-                    logger.warning("所有候选响应清洗后均为空。")
+                if incremental_fragments:
+                    joined = "".join(incremental_fragments)
+                    logger.info(f"增量拼接消息 (长度={len(joined)})")
+                    # 如果增量拼接的内容更长，优先使用
+                    if len(joined) > len(full_response):
+                        full_response = joined
+                        logger.info("增量拼接内容更长，使用增量拼接。")
 
                 if full_response:
                     cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗后的最终响应: {cleaned_response}")
+                    logger.info(f"清洗前长度={len(full_response)}, 清洗后长度={len(cleaned_response)}")
+                    logger.info(f"清洗后的最终响应: {cleaned_response[:200]}...")
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
                 else:
@@ -307,22 +289,23 @@ class NotionAIProvider(BaseProvider):
         if not content:
             return ""
         
-        # 【核心修复】如果内容包含 <lang primary="..." /> 标签，
-        # 则标签之前的所有内容都是模型的思考/推理过程，应该丢弃。
-        # 只保留标签之后的实际用户响应。
+        # 如果内容包含 <lang primary="..." /> 标签，
+        # 则标签之前的内容是模型的思考过程，只保留标签之后的实际响应。
         lang_match = re.search(r'<lang\s+primary="[^"]*"\s*/?>', content)
         if lang_match:
-            content = content[lang_match.end():]
+            after_lang = content[lang_match.end():].strip()
+            if after_lang:
+                content = after_lang
+            # 如果 <lang> 之后没有内容，保留原始 content 继续清洗
         
-        # 清除不完整的 <lang 标签片段
+        # 清除残留的 <lang 标签片段
         content = re.sub(r'<lang\b[^>]*(?:>|$)', '', content)
+        # 清除残留的 primary="..." 片段
+        content = re.sub(r'^\s*primary="[^"]*"\s*[-–]?\s*', '', content)
         
-        # 清除 <thinking> 和 <thought> 标签及其内容
+        # 清除 thinking 标签
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
-        
-        # 清除残留的 primary="..." 片段（当 <lang 被部分清除时）
-        content = re.sub(r'^\s*primary="[^"]*"\s*[-–]?\s*', '', content)
         
         return content.strip()
 
@@ -333,7 +316,18 @@ class NotionAIProvider(BaseProvider):
             if not s: return results
             
             data = json.loads(s)
-            logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)}")
+            data_type = data.get("type", "unknown")
+            
+            # 【调试】打印每行 NDJSON 的类型和关键信息
+            if data_type == "patch":
+                ops = data.get("v", [])
+                for op in ops:
+                    if isinstance(op, dict):
+                        logger.info(f"[NDJSON] type=patch, o={op.get('o')}, p={op.get('p')}, v_type={type(op.get('v')).__name__}, v_preview={str(op.get('v', ''))[:150]}")
+            elif data_type == "record-map":
+                logger.info(f"[NDJSON] type=record-map, keys={list(data.get('recordMap', {}).keys())}")
+            else:
+                logger.info(f"[NDJSON] type={data_type}, keys={list(data.keys())[:5]}")
             
             # 格式1: Gemini 返回的 markdown-chat 事件
             if data.get("type") == "markdown-chat":
@@ -350,7 +344,6 @@ class NotionAIProvider(BaseProvider):
                     op_type = operation.get("o")
                     path = operation.get("p", "")
                     value = operation.get("v")
-                    matched = False
                     
                     # Gemini 的完整内容 patch 格式
                     if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
@@ -358,23 +351,18 @@ class NotionAIProvider(BaseProvider):
                         if content:
                             logger.info("从 'patch' (Gemini-style) 中提取到完整内容。")
                             results.append(('final', content))
-                        matched = True
                     
                     # Gemini 的增量内容 patch 格式
                     elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Gemini增量) 中提取到内容: {content[:50]}")
                             results.append(('incremental', content))
-                        matched = True
                     
                     # Claude 和 GPT 的增量内容 patch 格式
                     elif op_type == "x" and "/value/" in path and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Claude/GPT增量) 中提取到内容: {content[:50]}")
                             results.append(('incremental', content))
-                        matched = True
                     
                     # Claude 和 GPT 的完整内容 patch 格式
                     elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
@@ -382,15 +370,8 @@ class NotionAIProvider(BaseProvider):
                         if content:
                             logger.info("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
                             results.append(('final', content))
-                        matched = True
-                    
-                    # 记录未匹配的 patch 操作，帮助诊断格式变化
-                    if not matched and op_type in ("a", "x", "s"):
-                        value_preview = str(value)[:200] if value else "None"
-                        logger.warning(f"未匹配的 patch 操作: o={op_type}, p={path}, v={value_preview}")
 
             # 格式3: 处理record-map类型的数据
-            # 【修复】遍历所有消息，取最后一条有效的 AI 回复（而非第一条问候语）
             elif data.get("type") == "record-map" and "recordMap" in data:
                 record_map = data["recordMap"]
                 if "thread_message" in record_map:
@@ -415,14 +396,14 @@ class NotionAIProvider(BaseProvider):
                                         break
                         
                         if content and isinstance(content, str):
-                            logger.info(f"从 record-map (type: {step_type}) 发现消息: {content[:80]}...")
+                            logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:80]}...")
                             last_content = content
                             last_step_type = step_type
                     
-                    # 使用最后一条有效消息（通常是 AI 对用户问题的回复）
+                    # 使用最后一条消息（而非第一条问候语）
                     if last_content:
-                        logger.info(f"从 record-map 选择最后一条消息 (type: {last_step_type}) 作为候选。")
-                        results.append(('record-map-final', last_content))
+                        logger.info(f"从 record-map 选择最后一条消息 (type: {last_step_type})。")
+                        results.append(('final', last_content))
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
