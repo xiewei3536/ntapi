@@ -255,18 +255,51 @@ class NotionAIProvider(BaseProvider):
             {"id": str(uuid.uuid4()), "type": "config", "value": config_value},
             {"id": str(uuid.uuid4()), "type": "context", "value": context_value}
         ]
-      
-        for msg in request_data.get("messages", []):
-            if msg.get("role") == "user":
+        # 【修复】预处理消息：合并连续的同角色消息，处理 system 消息
+        # Notion 要求 user 和 agent-inference 严格交替，连续同角色会导致 error
+        messages = request_data.get("messages", [])
+        system_prompt = ""
+        normalized_msgs = []
+        
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not content:
+                continue
+            
+            if role == "system":
+                # system 消息合并到第一条 user 消息前
+                system_prompt += content + "\n"
+            elif role in ("user", "assistant"):
+                # 检查是否与上一条消息同角色，如果是则合并
+                if normalized_msgs and normalized_msgs[-1]["role"] == role:
+                    normalized_msgs[-1]["content"] += "\n" + content
+                else:
+                    normalized_msgs.append({"role": role, "content": content})
+        
+        # 将 system prompt 合并到第一条 user 消息
+        if system_prompt and normalized_msgs and normalized_msgs[0]["role"] == "user":
+            normalized_msgs[0]["content"] = system_prompt + normalized_msgs[0]["content"]
+        elif system_prompt:
+            # 如果第一条不是 user，在最前面插入一条 user 消息
+            normalized_msgs.insert(0, {"role": "user", "content": system_prompt.strip()})
+        
+        # 确保消息以 user 结尾（Notion 需要最后一条是 user 提问）
+        # 如果最后一条是 assistant，移除它
+        while normalized_msgs and normalized_msgs[-1]["role"] == "assistant":
+            normalized_msgs.pop()
+        
+        for msg in normalized_msgs:
+            if msg["role"] == "user":
                 transcript.append({
                     "id": str(uuid.uuid4()),
                     "type": "user",
-                    "value": [[msg.get("content")]],
+                    "value": [[msg["content"]]],
                     "userId": settings.NOTION_USER_ID,
                     "createdAt": datetime.now().astimezone().isoformat()
                 })
-            elif msg.get("role") == "assistant":
-                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": msg.get("content")}]})
+            elif msg["role"] == "assistant":
+                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": msg["content"]}]})
 
         payload = {
             "traceId": str(uuid.uuid4()),
