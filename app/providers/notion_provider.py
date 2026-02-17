@@ -86,8 +86,10 @@ class NotionAIProvider(BaseProvider):
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
-            incremental_fragments: List[str] = []
             final_message: Optional[str] = None
+            streaming_started = False  # 是否已开始流式输出
+            content_replace_seen = False  # o=p 操作后标记为 True（<lang> 标签已清除）
+            buffered_tokens: List[str] = []  # o=p 之前的缓冲 token（可能是 <lang> 标签）
             
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
@@ -130,38 +132,63 @@ class NotionAIProvider(BaseProvider):
                     parsed_results = self._parse_ndjson_line_to_texts(line)
                     for text_type, content in parsed_results:
                         if text_type == 'final':
+                            # record-map 最终消息，仅在未流式输出时作为回退
                             final_message = content
+                        elif text_type == 'patch_replace':
+                            # o=p 操作：内容被替换（<lang> 标签已清除，实际内容开始）
+                            content_replace_seen = True
+                            buffered_tokens = []  # 丢弃 <lang> 标签内容
+                            # o=p 的值通常是 '\n\n'（空白），如果有实际内容则流式输出
+                            stripped = content.strip()
+                            if stripped:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=stripped)
+                                yield create_sse_data(chunk)
+                                streaming_started = True
                         elif text_type == 'incremental':
-                            incremental_fragments.append(content)
+                            if content_replace_seen:
+                                # 已过 <lang> 标签，直接流式输出每个 token
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=content)
+                                yield create_sse_data(chunk)
+                                streaming_started = True
+                            else:
+                                # 还在构建 <lang> 标签，先缓冲
+                                buffered_tokens.append(content)
+                                # 检查缓冲内容是否根本不包含 <lang>（某些模型可能不用）
+                                buffered_text = "".join(buffered_tokens)
+                                if len(buffered_tokens) > 10 and "<lang" not in buffered_text:
+                                    # 不像是 <lang> 标签模式，直接开始流式输出
+                                    content_replace_seen = True
+                                    cleaned = self._clean_content(buffered_text)
+                                    if cleaned:
+                                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
+                                        yield create_sse_data(chunk)
+                                        streaming_started = True
+                                    buffered_tokens = []
               
-                # 【修复】优先使用 record-map 的 final 消息（已组装好的干净回复）
-                # 增量片段包含模型的思考过程，不应优先使用
-                full_response = ""
-                if final_message:
-                    cleaned_final = self._clean_content(final_message)
-                    if cleaned_final:
-                        full_response = final_message
-                        logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
+                # 如果没有流式输出任何内容，回退到 record-map 或缓冲内容
+                if not streaming_started:
+                    full_response = ""
+                    if final_message:
+                        cleaned_final = self._clean_content(final_message)
+                        if cleaned_final:
+                            full_response = cleaned_final
+                            logger.info(f"回退: 使用 record-map final 消息 (长度={len(cleaned_final)})")
+                    
+                    if not full_response and buffered_tokens:
+                        joined = "".join(buffered_tokens)
+                        cleaned_joined = self._clean_content(joined)
+                        if cleaned_joined:
+                            full_response = cleaned_joined
+                            logger.info(f"回退: 使用缓冲的增量消息 (长度={len(cleaned_joined)})")
+                    
+                    if full_response:
+                        logger.info(f"回退响应: {full_response[:200]}...")
+                        chunk = create_chat_completion_chunk(request_id, model_name, content=full_response)
+                        yield create_sse_data(chunk)
                     else:
-                        logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
-                
-                if not full_response and incremental_fragments:
-                    joined = "".join(incremental_fragments)
-                    cleaned_joined = self._clean_content(joined)
-                    if cleaned_joined:
-                        full_response = joined
-                        logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
-                    else:
-                        logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
-
-                if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗前长度={len(full_response)}, 清洗后长度={len(cleaned_response)}")
-                    logger.info(f"清洗后的最终响应: {cleaned_response[:200]}...")
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
-                    yield create_sse_data(chunk)
+                        logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
                 else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                    logger.info(f"流式输出完成。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -263,7 +290,27 @@ class NotionAIProvider(BaseProvider):
         
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            raw_content = msg.get("content", "")
+            
+            # 【修复】处理多模态消息（图片+文字）
+            # OpenAI 格式中 content 可能是字符串或列表
+            # 列表格式: [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}]
+            # Notion AI 不支持图片，只提取文字部分
+            if isinstance(raw_content, list):
+                text_parts = []
+                for item in raw_content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                        elif item.get("type") == "image_url":
+                            # 跳过图片，添加提示
+                            text_parts.append("[用户发送了一张图片，但当前模型不支持图片输入]")
+                content = "\n".join(t for t in text_parts if t)
+            elif isinstance(raw_content, str):
+                content = raw_content
+            else:
+                content = str(raw_content) if raw_content else ""
+            
             if not content:
                 continue
             
@@ -405,6 +452,10 @@ class NotionAIProvider(BaseProvider):
                         content = value
                         if content:
                             results.append(('incremental', content))
+                    
+                    # 内容替换操作（o=p）：标志 <lang> 标签被清除，实际内容开始
+                    elif op_type == "p" and ("/value/" in path or path.endswith("/value")) and isinstance(value, str):
+                        results.append(('patch_replace', value))
                     
                     # Claude 和 GPT 的完整内容 patch 格式
                     elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
