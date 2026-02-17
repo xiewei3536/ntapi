@@ -384,27 +384,27 @@ class NotionAIProvider(BaseProvider):
             elif data.get("type") == "record-map" and "recordMap" in data:
                 record_map = data["recordMap"]
                 if "thread_message" in record_map:
-                    last_content = ""
-                    last_step_type = ""
+                    # 【修复】只选取最后一条 user 消息之后的 agent-inference
+                    # record-map 包含完整对话历史，历史中的 agent-inference 不是新回复
+                    all_messages = []
                     msg_count = 0
                     for msg_id, msg_data in record_map["thread_message"].items():
                         msg_count += 1
                         value_data = msg_data.get("value", {}).get("value", {})
                         step = value_data.get("step", {})
                         
-                        # 【调试】打印每条 thread_message 的结构
                         if not step:
                             logger.info(f"[record-map] msg_id={msg_id}, no step, value keys={list(value_data.keys())[:5]}")
+                            all_messages.append({"step_type": "unknown", "content": ""})
                             continue
 
-                        content = ""
                         step_type = step.get("type")
                         logger.info(f"[record-map] msg_id={msg_id}, step_type={step_type}")
-
+                        
+                        content = ""
                         if step_type == "markdown-chat":
                             content = step.get("value", "")
                         elif step_type == "agent-inference":
-                            # 【修复】合并所有 text 类型的内容（不再 break 取第一条）
                             agent_values = step.get("value", [])
                             text_parts = []
                             if isinstance(agent_values, list):
@@ -418,14 +418,33 @@ class NotionAIProvider(BaseProvider):
                         
                         if content and isinstance(content, str):
                             logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:120]}...")
-                            last_content = content
-                            last_step_type = step_type
+                        
+                        all_messages.append({"step_type": step_type, "content": content})
                     
                     logger.info(f"[record-map] 共扫描 {msg_count} 条 thread_message")
-                    # 使用最后一条消息（而非第一条问候语）
-                    if last_content:
-                        logger.info(f"从 record-map 选择最后一条消息 (type: {last_step_type})。")
-                        results.append(('final', last_content))
+                    
+                    # 找到最后一条 user 消息的位置
+                    last_user_idx = -1
+                    for i, msg in enumerate(all_messages):
+                        if msg["step_type"] == "user":
+                            last_user_idx = i
+                    
+                    # 只在最后一条 user 消息之后搜索 agent-inference
+                    new_content = ""
+                    new_step_type = ""
+                    search_start = last_user_idx + 1 if last_user_idx >= 0 else 0
+                    for i in range(search_start, len(all_messages)):
+                        msg = all_messages[i]
+                        if msg["step_type"] in ("agent-inference", "markdown-chat") and msg["content"]:
+                            new_content = msg["content"]
+                            new_step_type = msg["step_type"]
+                    
+                    if new_content:
+                        logger.info(f"从 record-map 选择最后一条 user 之后的新消息 (type: {new_step_type})。")
+                        results.append(('final', new_content))
+                    elif last_user_idx >= 0:
+                        # 最后一条 user 之后没有 agent-inference，可能是 error
+                        logger.warning(f"[record-map] 最后一条 user 之后没有找到有效的 agent-inference（可能 Notion 返回了 error）")
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
