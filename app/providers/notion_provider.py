@@ -307,22 +307,22 @@ class NotionAIProvider(BaseProvider):
         if not content:
             return ""
         
-        # 清除完整的 <lang .../> 标签
-        content = re.sub(r'<lang\s+primary="[^"]*"\s*/?>\n*', '', content)
-        # 清除不完整的 <lang 标签片段（如 "<lang" 或 "<lang primary=..."）
+        # 【核心修复】如果内容包含 <lang primary="..." /> 标签，
+        # 则标签之前的所有内容都是模型的思考/推理过程，应该丢弃。
+        # 只保留标签之后的实际用户响应。
+        lang_match = re.search(r'<lang\s+primary="[^"]*"\s*/?>', content)
+        if lang_match:
+            content = content[lang_match.end():]
+        
+        # 清除不完整的 <lang 标签片段
         content = re.sub(r'<lang\b[^>]*(?:>|$)', '', content)
         
+        # 清除 <thinking> 和 <thought> 标签及其内容
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
         
-        content = re.sub(r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Sincethe.*?user.*?asked.*?in.*?Chinese.*?and.*?specifically.*?requested.*?a.*?Chinese.*?response.*?I.*?should.*?respond.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?What model are you.*?in Chinese and specifically requesting.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+        # 清除残留的 primary="..." 片段（当 <lang 被部分清除时）
+        content = re.sub(r'^\s*primary="[^"]*"\s*[-–]?\s*', '', content)
         
         return content.strip()
 
