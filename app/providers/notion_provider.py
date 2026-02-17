@@ -17,8 +17,8 @@ from app.core.config import settings
 from app.providers.base_provider import BaseProvider
 from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
 
-MAX_RETRY_ATTEMPTS = 10
-RETRY_DELAY_SECONDS = 2
+MAX_RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 3  # 指数退避基础延迟（秒）: 3, 6, 12, 24, 48
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -319,8 +319,9 @@ class NotionAIProvider(BaseProvider):
                     # 没有有效回复
                     last_error_msg = error_message_from_notion or "Notion 返回空回复"
                     if attempt < MAX_RETRY_ATTEMPTS:
-                        logger.warning(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] Notion 返回 error: {last_error_msg}，{RETRY_DELAY_SECONDS}秒后重试...")
-                        await asyncio.sleep(RETRY_DELAY_SECONDS)
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))  # 指数退避: 3, 6, 12, 24, 48
+                        logger.warning(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] Notion 返回 error: {last_error_msg}，{delay}秒后重试...")
+                        await asyncio.sleep(delay)
                     else:
                         logger.error(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] 所有重试均失败。最后错误: {last_error_msg}")
 
@@ -331,72 +332,11 @@ class NotionAIProvider(BaseProvider):
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
                 else:
-                    # 所有重试都失败，尝试自动刷新 Token
-                    logger.warning(f"所有 {MAX_RETRY_ATTEMPTS} 次重试均失败，尝试自动刷新 Token...")
-                    refresh_success = await self.auto_refresh_token()
-                    
-                    if refresh_success:
-                        # Token 刷新成功，最后再试一次
-                        logger.info("Token 刷新成功，进行最终重试...")
-                        final_try_fragments: List[str] = []
-                        final_try_message: Optional[str] = None
-                        
-                        thread_id = await self._create_thread(thread_type)
-                        payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
-                        headers = self._prepare_headers()
-                        
-                        def final_sync_stream():
-                            try:
-                                response = self.scraper.post(
-                                    self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
-                                    timeout=settings.API_REQUEST_TIMEOUT
-                                )
-                                response.raise_for_status()
-                                for line in response.iter_lines():
-                                    if line:
-                                        yield line
-                            except Exception as e:
-                                yield e
-                        
-                        final_gen = final_sync_stream()
-                        while True:
-                            line = await run_in_threadpool(lambda: next(final_gen, None))
-                            if line is None:
-                                break
-                            if isinstance(line, Exception):
-                                logger.error(f"最终重试请求异常: {line}")
-                                break
-                            parsed = self._parse_ndjson_line_to_texts(line)
-                            for t, c in parsed:
-                                if t == 'final':
-                                    final_try_message = c
-                                elif t == 'incremental':
-                                    final_try_fragments.append(c)
-                        
-                        # 尝试获取最终重试的响应
-                        final_resp = ""
-                        if final_try_message:
-                            cleaned = self._clean_content(final_try_message)
-                            if cleaned:
-                                final_resp = cleaned
-                        if not final_resp and final_try_fragments:
-                            cleaned = self._clean_content("".join(final_try_fragments))
-                            if cleaned:
-                                final_resp = cleaned
-                        
-                        if final_resp:
-                            logger.info(f"✅ Token 刷新后重试成功! 响应长度={len(final_resp)}")
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=final_resp)
-                            yield create_sse_data(chunk)
-                        else:
-                            error_reply = f"⚠️ Token 已自动刷新，但 Notion AI 仍返回错误。\n错误信息: {last_error_msg}\n请稍后再试。"
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=error_reply)
-                            yield create_sse_data(chunk)
-                    else:
-                        error_reply = f"⚠️ Notion AI 返回错误，已重试 {MAX_RETRY_ATTEMPTS} 次仍失败，自动刷新 Token 也失败。\n错误信息: {last_error_msg}\n请手动更新 Token: POST /admin/update-token"
-                        logger.error(f"所有重试和自动刷新均失败: {error_reply}")
-                        chunk = create_chat_completion_chunk(request_id, model_name, content=error_reply)
-                        yield create_sse_data(chunk)
+                    # 所有重试都失败
+                    error_reply = f"⚠️ Notion AI 暂时不可用，已重试 {MAX_RETRY_ATTEMPTS} 次。请稍后再试。"
+                    logger.error(f"所有重试均失败: {last_error_msg}")
+                    chunk = create_chat_completion_chunk(request_id, model_name, content=error_reply)
+                    yield create_sse_data(chunk)
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
