@@ -32,18 +32,8 @@ class NotionAIProvider(BaseProvider):
         }
         
         # 检查必要凭证
-        if not settings.NOTION_SPACE_ID or not settings.NOTION_USER_ID:
-            raise ValueError("配置错误: NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中设置。")
-        
-        # 如果没有 token 但有帐密，自动登入获取
-        if not settings.NOTION_COOKIE:
-            if settings.NOTION_USER_EMAIL and settings.NOTION_PASSWORD:
-                logger.info("未检测到 NOTION_COOKIE，尝试使用帐密自动登入...")
-                success = self._login_and_get_token()
-                if not success:
-                    raise ValueError("自动登入失败，请检查 NOTION_USER_EMAIL 和 NOTION_PASSWORD 是否正确。")
-            else:
-                raise ValueError("配置错误: 必须设置 NOTION_COOKIE 或同时设置 NOTION_USER_EMAIL 和 NOTION_PASSWORD。")
+        if not all([settings.NOTION_COOKIE, settings.NOTION_SPACE_ID, settings.NOTION_USER_ID]):
+            raise ValueError("配置错误: NOTION_COOKIE, NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中全部设置。")
         
         self._warmup_session()
 
