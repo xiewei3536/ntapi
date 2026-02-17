@@ -31,9 +31,20 @@ class NotionAIProvider(BaseProvider):
             "saveTransactions": "https://www.notion.so/api/v3/saveTransactionsFanout"
         }
         
-        if not all([settings.NOTION_COOKIE, settings.NOTION_SPACE_ID, settings.NOTION_USER_ID]):
-            raise ValueError("配置错误: NOTION_COOKIE, NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中全部设置。")
-
+        # 检查必要凭证
+        if not settings.NOTION_SPACE_ID or not settings.NOTION_USER_ID:
+            raise ValueError("配置错误: NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中设置。")
+        
+        # 如果没有 token 但有帐密，自动登入获取
+        if not settings.NOTION_COOKIE:
+            if settings.NOTION_USER_EMAIL and settings.NOTION_PASSWORD:
+                logger.info("未检测到 NOTION_COOKIE，尝试使用帐密自动登入...")
+                success = self._login_and_get_token()
+                if not success:
+                    raise ValueError("自动登入失败，请检查 NOTION_USER_EMAIL 和 NOTION_PASSWORD 是否正确。")
+            else:
+                raise ValueError("配置错误: 必须设置 NOTION_COOKIE 或同时设置 NOTION_USER_EMAIL 和 NOTION_PASSWORD。")
+        
         self._warmup_session()
 
     def _warmup_session(self):
@@ -51,7 +62,6 @@ class NotionAIProvider(BaseProvider):
         """热更新 Notion Cookie/Token，无需重启服务"""
         old_token_preview = (settings.NOTION_COOKIE or "")[:20] + "..."
         settings.NOTION_COOKIE = new_token
-        # 重新创建 scraper 以清除旧 session
         self.scraper = cloudscraper.create_scraper()
         self._warmup_session()
         new_token_preview = new_token[:20] + "..."
@@ -75,42 +85,43 @@ class NotionAIProvider(BaseProvider):
             logger.error(f"Session 保活失败: {e}")
             return False
 
-    async def auto_refresh_token(self) -> bool:
+    def _login_and_get_token(self) -> bool:
         """
-        自动登入 Notion 获取新的 token_v2。
-        需要在 .env 中设置 NOTION_USER_EMAIL 和 NOTION_PASSWORD。
+        同步登入 Notion 获取 token_v2。用于启动时。
         """
         email = settings.NOTION_USER_EMAIL
         password = settings.NOTION_PASSWORD
         
         if not email or not password:
-            logger.error("自动刷新 Token 失败: 未配置 NOTION_USER_EMAIL 或 NOTION_PASSWORD")
+            logger.error("登入失败: 未配置 NOTION_USER_EMAIL 或 NOTION_PASSWORD")
             return False
         
         try:
-            logger.info(f"正在自动刷新 Token... (email: {email[:5]}***)")
+            logger.info(f"正在登入 Notion... (email: {email[:5]}***)")
             
-            # 用新的 scraper 避免旧 session 干扰
             login_scraper = cloudscraper.create_scraper()
             
-            # Step 1: 先访问 Notion 首页获取必要的 cookies
-            login_scraper.get("https://www.notion.so/", timeout=30)
+            # Step 1: 访问 Notion 登录页，获取 CSRF cookies
+            logger.info("Step 1: 访问 Notion 首页获取 cookies...")
+            home_resp = login_scraper.get("https://www.notion.so/login", timeout=30)
+            logger.info(f"首页状态码: {home_resp.status_code}, cookies: {[c.name for c in login_scraper.cookies]}")
             
-            # Step 2: 调用 loginWithEmail API
-            login_response = await run_in_threadpool(
-                lambda: login_scraper.post(
-                    "https://www.notion.so/api/v3/loginWithEmail",
-                    json={
-                        "email": email,
-                        "password": password,
-                        "csrfState": ""
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json"
-                    },
-                    timeout=30
-                )
+            # Step 2: 登入
+            logger.info("Step 2: 发送登入请求...")
+            login_response = login_scraper.post(
+                "https://www.notion.so/api/v3/loginWithEmail",
+                json={
+                    "email": email,
+                    "password": password
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Origin": "https://www.notion.so",
+                    "Referer": "https://www.notion.so/login",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                },
+                timeout=30
             )
             
             logger.info(f"登入响应状态码: {login_response.status_code}")
@@ -120,35 +131,64 @@ class NotionAIProvider(BaseProvider):
                 logger.error(f"登入失败: HTTP {login_response.status_code}, 响应: {resp_text}")
                 return False
             
-            # Step 3: 从 cookies 中提取 token_v2
-            new_token = None
-            for cookie in login_scraper.cookies:
-                if cookie.name == "token_v2":
-                    new_token = cookie.value
-                    break
+            # Step 3: 提取 token_v2
+            new_token = self._extract_token_from_response(login_scraper, login_response)
             
             if not new_token:
-                # 也检查响应头的 Set-Cookie
-                for header_val in login_response.headers.get("Set-Cookie", "").split(","):
-                    if "token_v2=" in header_val:
-                        new_token = header_val.split("token_v2=")[1].split(";")[0]
-                        break
-            
-            if not new_token:
-                logger.error("登入成功但未找到 token_v2 cookie")
-                logger.info(f"登入响应 cookies: {[c.name for c in login_scraper.cookies]}")
+                logger.error("登入成功但未找到 token_v2")
+                logger.info(f"响应 cookies: {[c.name for c in login_scraper.cookies]}")
+                # 尝试从响应 JSON 中获取
+                try:
+                    resp_json = login_response.json()
+                    logger.info(f"登入响应 JSON keys: {list(resp_json.keys())}")
+                except:
+                    pass
                 return False
             
             # Step 4: 更新 token
-            old_preview = (settings.NOTION_COOKIE or "")[:20] + "..."
-            new_preview = new_token[:20] + "..."
-            self.update_token(new_token)
-            logger.info(f"✅ Token 自动刷新成功! {old_preview} -> {new_preview}")
+            settings.NOTION_COOKIE = new_token
+            self.scraper = login_scraper  # 复用已登入的 scraper
+            logger.info(f"✅ 登入成功！Token: {new_token[:20]}...")
             return True
             
         except Exception as e:
-            logger.error(f"自动刷新 Token 异常: {e}", exc_info=True)
+            logger.error(f"登入异常: {e}", exc_info=True)
             return False
+
+    def _extract_token_from_response(self, scraper, response) -> Optional[str]:
+        """从 scraper cookies 或 response headers 中提取 token_v2"""
+        # 方法 1: 从 scraper cookies
+        for cookie in scraper.cookies:
+            if cookie.name == "token_v2":
+                return cookie.value
+        
+        # 方法 2: 从 Set-Cookie headers
+        set_cookie = response.headers.get("Set-Cookie", "")
+        if "token_v2=" in set_cookie:
+            for part in set_cookie.split(","):
+                if "token_v2=" in part:
+                    token = part.split("token_v2=")[1].split(";")[0].strip()
+                    if token:
+                        return token
+        
+        # 方法 3: 从响应 JSON
+        try:
+            resp_json = response.json()
+            if "token_v2" in resp_json:
+                return resp_json["token_v2"]
+        except:
+            pass
+        
+        return None
+
+    async def auto_refresh_token(self) -> bool:
+        """
+        异步版本：自动登入 Notion 获取新的 token_v2。
+        """
+        result = await run_in_threadpool(self._login_and_get_token)
+        if result:
+            self._warmup_session()
+        return result
             
     async def _create_thread(self, thread_type: str) -> str:
         thread_id = str(uuid.uuid4())
