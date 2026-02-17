@@ -4,7 +4,6 @@ import time
 import logging
 import uuid
 import re
-import asyncio
 import cloudscraper
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
@@ -17,9 +16,6 @@ from app.core.config import settings
 from app.providers.base_provider import BaseProvider
 from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
 
-MAX_RETRY_ATTEMPTS = 5
-RETRY_BASE_DELAY = 3  # 指数退避基础延迟（秒）: 3, 6, 12, 24, 48
-
 # 设置日志记录器
 logger = logging.getLogger(__name__)
 
@@ -31,10 +27,9 @@ class NotionAIProvider(BaseProvider):
             "saveTransactions": "https://www.notion.so/api/v3/saveTransactionsFanout"
         }
         
-        # 检查必要凭证
         if not all([settings.NOTION_COOKIE, settings.NOTION_SPACE_ID, settings.NOTION_USER_ID]):
             raise ValueError("配置错误: NOTION_COOKIE, NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中全部设置。")
-        
+
         self._warmup_session()
 
     def _warmup_session(self):
@@ -47,153 +42,6 @@ class NotionAIProvider(BaseProvider):
             logger.info("会话预热成功。")
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
-
-    def update_token(self, new_token: str):
-        """热更新 Notion Cookie/Token，无需重启服务"""
-        old_token_preview = (settings.NOTION_COOKIE or "")[:20] + "..."
-        settings.NOTION_COOKIE = new_token
-        self.scraper = cloudscraper.create_scraper()
-        self._warmup_session()
-        new_token_preview = new_token[:20] + "..."
-        logger.info(f"Token 已热更新: {old_token_preview} -> {new_token_preview}")
-
-    async def keepalive(self):
-        """发送保活请求，维持 Notion session"""
-        try:
-            headers = self._prepare_headers()
-            headers.pop("Accept", None)
-            response = await run_in_threadpool(
-                lambda: self.scraper.get("https://www.notion.so/api/v3/getSpaces", headers=headers, timeout=30)
-            )
-            if response.status_code == 200:
-                logger.info("Session 保活成功 ✓")
-                return True
-            else:
-                logger.warning(f"Session 保活返回非 200 状态码: {response.status_code}")
-                return False
-        except Exception as e:
-            logger.error(f"Session 保活失败: {e}")
-            return False
-
-    def _login_and_get_token(self) -> bool:
-        """
-        同步登入 Notion 获取 token_v2。
-        参考 notion-py 实现: 使用 requests.Session 直接 POST loginWithEmail。
-        """
-        import requests as req
-        
-        email = settings.NOTION_USER_EMAIL
-        password = settings.NOTION_PASSWORD
-        
-        if not email or not password:
-            logger.error("登入失败: 未配置 NOTION_USER_EMAIL 或 NOTION_PASSWORD")
-            return False
-        
-        try:
-            # Debug: 打印凭证信息（安全脱敏）
-            logger.info(f"正在登入 Notion...")
-            logger.info(f"  Email: {email}")
-            logger.info(f"  Password 长度: {len(password)}, 首字: '{password[0]}', 尾字: '{password[-1]}'")
-            
-            # 使用 requests.Session (参考 notion-py 的做法)
-            session = req.Session()
-            
-            # 直接 POST 登入，不需要 csrfState
-            login_response = session.post(
-                "https://www.notion.so/api/v3/loginWithEmail",
-                json={
-                    "email": email,
-                    "password": password
-                },
-                timeout=30
-            )
-            
-            logger.info(f"登入响应状态码: {login_response.status_code}")
-            
-            if login_response.status_code != 200:
-                resp_text = login_response.text[:500]
-                logger.error(f"登入失败 (方法1): HTTP {login_response.status_code}, 响应: {resp_text}")
-                
-                # 备用方法: 用 cloudscraper 先访问首页再登入
-                logger.info("尝试备用登入方法 (cloudscraper)...")
-                login_scraper = cloudscraper.create_scraper()
-                login_scraper.get("https://www.notion.so/login", timeout=30)
-                login_response = login_scraper.post(
-                    "https://www.notion.so/api/v3/loginWithEmail",
-                    json={"email": email, "password": password},
-                    headers={
-                        "Content-Type": "application/json",
-                        "Origin": "https://www.notion.so",
-                        "Referer": "https://www.notion.so/login"
-                    },
-                    timeout=30
-                )
-                logger.info(f"备用方法响应状态码: {login_response.status_code}")
-                if login_response.status_code != 200:
-                    resp_text = login_response.text[:500]
-                    logger.error(f"备用方法也失败: HTTP {login_response.status_code}, 响应: {resp_text}")
-                    return False
-                session = login_scraper
-            
-            # 提取 token_v2
-            new_token = self._extract_token_from_response(session, login_response)
-            
-            if not new_token:
-                logger.error("登入成功但未找到 token_v2")
-                logger.info(f"响应 cookies: {[c.name for c in session.cookies]}")
-                try:
-                    resp_json = login_response.json()
-                    logger.info(f"登入响应 JSON keys: {list(resp_json.keys())}")
-                except:
-                    pass
-                return False
-            
-            # 更新 token，复用已登入的 session 作为 scraper
-            settings.NOTION_COOKIE = new_token
-            self.scraper = cloudscraper.create_scraper()
-            # 将 token 设入 scraper cookies
-            self.scraper.cookies.set("token_v2", new_token, domain=".notion.so")
-            logger.info(f"✅ 登入成功！Token: {new_token[:20]}...")
-            return True
-            
-        except Exception as e:
-            logger.error(f"登入异常: {e}", exc_info=True)
-            return False
-
-    def _extract_token_from_response(self, scraper, response) -> Optional[str]:
-        """从 scraper cookies 或 response headers 中提取 token_v2"""
-        # 方法 1: 从 scraper cookies
-        for cookie in scraper.cookies:
-            if cookie.name == "token_v2":
-                return cookie.value
-        
-        # 方法 2: 从 Set-Cookie headers
-        set_cookie = response.headers.get("Set-Cookie", "")
-        if "token_v2=" in set_cookie:
-            for part in set_cookie.split(","):
-                if "token_v2=" in part:
-                    token = part.split("token_v2=")[1].split(";")[0].strip()
-                    if token:
-                        return token
-        
-        # 方法 3: 从响应 JSON
-        try:
-            resp_json = response.json()
-            if "token_v2" in resp_json:
-                return resp_json["token_v2"]
-        except:
-            pass
-        
-        return None
-
-    async def auto_refresh_token(self) -> bool:
-        """
-        异步版本：自动登入 Notion 获取新的 token_v2。
-        """
-        result = await run_in_threadpool(self._login_and_get_token)
-        if result:
-            self._warmup_session()
-        return result
             
     async def _create_thread(self, thread_type: str) -> str:
         thread_id = str(uuid.uuid4())
@@ -238,92 +86,73 @@ class NotionAIProvider(BaseProvider):
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
+            incremental_fragments: List[str] = []
+            final_message: Optional[str] = None
             
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
                 mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
+                
                 thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
+                
+                thread_id = await self._create_thread(thread_type)
+                payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
+                headers = self._prepare_headers()
 
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
-                # 【重试机制】最多重试 MAX_RETRY_ATTEMPTS 次
-                full_response = ""
-                last_error_msg = ""
-                
-                for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-                    incremental_fragments: List[str] = []
-                    final_message: Optional[str] = None
-                    error_message_from_notion: Optional[str] = None
-                    
-                    thread_id = await self._create_thread(thread_type)
-                    payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
-                    headers = self._prepare_headers()
+                def sync_stream_iterator():
+                    try:
+                        logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
+                        logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                        
+                        response = self.scraper.post(
+                            self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
+                            timeout=settings.API_REQUEST_TIMEOUT
+                        )
+                        response.raise_for_status()
+                        for line in response.iter_lines():
+                            if line:
+                                yield line
+                    except Exception as e:
+                        yield e
 
-                    def sync_stream_iterator():
-                        try:
-                            logger.info(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] 请求 Notion AI URL: {self.api_endpoints['runInference']}")
-                            logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-                            
-                            response = self.scraper.post(
-                                self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
-                                timeout=settings.API_REQUEST_TIMEOUT
-                            )
-                            response.raise_for_status()
-                            for line in response.iter_lines():
-                                if line:
-                                    yield line
-                        except Exception as e:
-                            yield e
-
-                    sync_gen = sync_stream_iterator()
-                  
-                    while True:
-                        line = await run_in_threadpool(lambda: next(sync_gen, None))
-                        if line is None:
-                            break
-                        if isinstance(line, Exception):
-                            raise line
-
-                        parsed_results = self._parse_ndjson_line_to_texts(line)
-                        for text_type, content in parsed_results:
-                            if text_type == 'final':
-                                final_message = content
-                            elif text_type == 'incremental':
-                                incremental_fragments.append(content)
-                            elif text_type == 'error':
-                                error_message_from_notion = content
-                  
-                    # 优先使用 record-map 的 final 消息
-                    if final_message:
-                        cleaned_final = self._clean_content(final_message)
-                        if cleaned_final:
-                            full_response = final_message
-                            logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
-                        else:
-                            logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
-                    
-                    if not full_response and incremental_fragments:
-                        joined = "".join(incremental_fragments)
-                        cleaned_joined = self._clean_content(joined)
-                        if cleaned_joined:
-                            full_response = joined
-                            logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
-                        else:
-                            logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
-
-                    if full_response:
-                        # 成功获取到回复，跳出重试循环
+                sync_gen = sync_stream_iterator()
+              
+                while True:
+                    line = await run_in_threadpool(lambda: next(sync_gen, None))
+                    if line is None:
                         break
-                    
-                    # 没有有效回复
-                    last_error_msg = error_message_from_notion or "Notion 返回空回复"
-                    if attempt < MAX_RETRY_ATTEMPTS:
-                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))  # 指数退避: 3, 6, 12, 24, 48
-                        logger.warning(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] Notion 返回 error: {last_error_msg}，{delay}秒后重试...")
-                        await asyncio.sleep(delay)
+                    if isinstance(line, Exception):
+                        raise line
+
+                    parsed_results = self._parse_ndjson_line_to_texts(line)
+                    for text_type, content in parsed_results:
+                        if text_type == 'final':
+                            final_message = content
+                        elif text_type == 'incremental':
+                            incremental_fragments.append(content)
+              
+                # 【修复】优先使用 record-map 的 final 消息（已组装好的干净回复）
+                # 增量片段包含模型的思考过程，不应优先使用
+                full_response = ""
+                if final_message:
+                    cleaned_final = self._clean_content(final_message)
+                    if cleaned_final:
+                        full_response = final_message
+                        logger.info(f"使用 final 消息 (清洗后长度={len(cleaned_final)})")
                     else:
-                        logger.error(f"[尝试 {attempt}/{MAX_RETRY_ATTEMPTS}] 所有重试均失败。最后错误: {last_error_msg}")
+                        logger.info(f"final 消息清洗后为空 (原始长度={len(final_message)})，尝试增量拼接")
+                
+                if not full_response and incremental_fragments:
+                    joined = "".join(incremental_fragments)
+                    cleaned_joined = self._clean_content(joined)
+                    if cleaned_joined:
+                        full_response = joined
+                        logger.info(f"使用增量拼接消息 (清洗后长度={len(cleaned_joined)})")
+                    else:
+                        logger.info(f"增量拼接消息清洗后也为空 (原始长度={len(joined)})")
 
                 if full_response:
                     cleaned_response = self._clean_content(full_response)
@@ -332,11 +161,7 @@ class NotionAIProvider(BaseProvider):
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
                 else:
-                    # 所有重试都失败
-                    error_reply = f"⚠️ Notion AI 暂时不可用，已重试 {MAX_RETRY_ATTEMPTS} 次。请稍后再试。"
-                    logger.error(f"所有重试均失败: {last_error_msg}")
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=error_reply)
-                    yield create_sse_data(chunk)
+                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -433,7 +258,6 @@ class NotionAIProvider(BaseProvider):
         # 【修复】预处理消息：合并连续的同角色消息，处理 system 消息
         # Notion 要求 user 和 agent-inference 严格交替，连续同角色会导致 error
         messages = request_data.get("messages", [])
-        
         system_prompt = ""
         normalized_msgs = []
         
@@ -485,7 +309,7 @@ class NotionAIProvider(BaseProvider):
             "createThread": False,
             "isPartialTranscript": True,
             "asPatchResponse": True,
-            "generateTitle": False,
+            "generateTitle": True,
             "saveAllThreadOperations": True,
             "threadType": thread_type
         }
@@ -500,7 +324,6 @@ class NotionAIProvider(BaseProvider):
             }
         
         return payload
-
 
     def _clean_content(self, content: str) -> str:
         if not content:
@@ -525,8 +348,6 @@ class NotionAIProvider(BaseProvider):
         # 清除 thinking 标签
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
-        
-
         
         return content.strip()
 
@@ -627,19 +448,8 @@ class NotionAIProvider(BaseProvider):
                                             text_parts.append(text_content)
                                             logger.info(f"[record-map] text item (长度={len(text_content)}): {text_content[:100]}...")
                             content = "\n".join(text_parts) if text_parts else ""
-                        elif step_type == "error":
-                            # 【提取错误信息】
-                            error_value = step.get("value", {})
-                            if isinstance(error_value, dict):
-                                error_msg = error_value.get("message", "") or error_value.get("error", "") or str(error_value)
-                            elif isinstance(error_value, str):
-                                error_msg = error_value
-                            else:
-                                error_msg = str(error_value)
-                            logger.warning(f"[record-map] Notion 错误: {error_msg}")
-                            content = error_msg
                         
-                        if content and isinstance(content, str) and step_type != "error":
+                        if content and isinstance(content, str):
                             logger.info(f"从 record-map (type: {step_type}) 发现消息 (长度={len(content)}): {content[:120]}...")
                         
                         all_messages.append({"step_type": step_type, "content": content})
@@ -655,25 +465,19 @@ class NotionAIProvider(BaseProvider):
                     # 只在最后一条 user 消息之后搜索 agent-inference
                     new_content = ""
                     new_step_type = ""
-                    error_content = ""
                     search_start = last_user_idx + 1 if last_user_idx >= 0 else 0
                     for i in range(search_start, len(all_messages)):
                         msg = all_messages[i]
                         if msg["step_type"] in ("agent-inference", "markdown-chat") and msg["content"]:
                             new_content = msg["content"]
                             new_step_type = msg["step_type"]
-                        elif msg["step_type"] == "error" and msg["content"]:
-                            error_content = msg["content"]
                     
                     if new_content:
                         logger.info(f"从 record-map 选择最后一条 user 之后的新消息 (type: {new_step_type})。")
                         results.append(('final', new_content))
-                    elif error_content:
-                        logger.warning(f"[record-map] Notion 返回错误: {error_content}")
-                        results.append(('error', error_content))
                     elif last_user_idx >= 0:
+                        # 最后一条 user 之后没有 agent-inference，可能是 error
                         logger.warning(f"[record-map] 最后一条 user 之后没有找到有效的 agent-inference（可能 Notion 返回了 error）")
-                        results.append(('error', '未知错误'))
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
